@@ -686,6 +686,80 @@ impl SQLiteReader {
         Ok(())
     }
 
+    /// Pre-load ALL partial paths from SQLite into the in-memory database.
+    ///
+    /// After this call, `incoming_paths` is fully populated for all known nodes,
+    /// so the stitcher finds the same complete paths as the old in-memory
+    /// `DatabaseCandidates` approach.  Call this once before
+    /// `ForwardPartialPathStitcher::find_all_complete_partial_paths`.
+    pub fn load_all_paths(&mut self, cancellation_flag: &dyn CancellationFlag) -> Result<()> {
+        // ── file-node paths ──────────────────────────────────────────────────
+        let node_data: Vec<(String, Vec<u8>)> = {
+            let mut stmt = self.conn.prepare_cached("SELECT file, value FROM file_paths")?;
+            let result = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<std::result::Result<_, _>>()?;
+            result
+        };
+        for (file, value) in node_data {
+            cancellation_flag.check("loading all paths")?;
+            Self::load_graph_for_file_inner(
+                &file,
+                &mut self.graph,
+                &mut self.loaded_graphs,
+                &self.conn,
+                &mut self.stats,
+            )?;
+            let (path, _): (serde::PartialPath, usize) =
+                bincode::decode_from_slice(&value, BINCODE_CONFIG)?;
+            let path = path.to_partial_path(&mut self.graph, &mut self.partials)?;
+            self.db.add_partial_path(&self.graph, &mut self.partials, path);
+        }
+        // Mark every file node as loaded so lazy re-loading is a no-op during stitching.
+        let file_nodes: Vec<Handle<Node>> = self
+            .graph
+            .iter_nodes()
+            .filter(|&n| self.graph[n].file().is_some())
+            .collect();
+        self.loaded_node_paths.extend(file_nodes);
+
+        // ── root paths ───────────────────────────────────────────────────────
+        let root_data: Vec<(String, Vec<u8>)> = {
+            let mut stmt = self.conn.prepare_cached("SELECT file, value FROM root_paths")?;
+            let result = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<std::result::Result<_, _>>()?;
+            result
+        };
+        for (file, value) in root_data {
+            cancellation_flag.check("loading all root paths")?;
+            Self::load_graph_for_file_inner(
+                &file,
+                &mut self.graph,
+                &mut self.loaded_graphs,
+                &self.conn,
+                &mut self.stats,
+            )?;
+            let (path, _): (serde::PartialPath, usize) =
+                bincode::decode_from_slice(&value, BINCODE_CONFIG)?;
+            let path = path.to_partial_path(&mut self.graph, &mut self.partials)?;
+            self.db.add_partial_path(&self.graph, &mut self.partials, path);
+        }
+        // Mark all stored root-path symbol-stack keys as loaded to suppress re-queries.
+        let stacks: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare_cached("SELECT DISTINCT symbol_stack FROM root_paths")?;
+            let result = stmt
+                .query_map([], |row| row.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            result
+        };
+        self.loaded_root_paths.extend(stacks);
+
+        Ok(())
+    }
+
     /// Ensure all possible extensions for the given partial path are loaded.
     pub fn load_partial_path_extensions(
         &mut self,
